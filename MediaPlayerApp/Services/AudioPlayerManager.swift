@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import Foundation
 import MediaPlayer
 
 @MainActor
@@ -19,7 +20,10 @@ final class AudioPlayerManager: NSObject, ObservableObject {
     }
     @Published var playbackError: String?
 
-    private var player: AVAudioPlayer?
+    private var player: AVPlayer?
+    private var playerItemStatusObservation: NSKeyValueObservation?
+    private var playbackEndObserver: NSObjectProtocol?
+    private var playbackFailureObserver: NSObjectProtocol?
     private var progressTask: Task<Void, Never>?
     private var wasPlayingBeforeInterruption = false
     private let commandCenter = MPRemoteCommandCenter.shared()
@@ -32,6 +36,7 @@ final class AudioPlayerManager: NSObject, ObservableObject {
 
     deinit {
         progressTask?.cancel()
+        removePlaybackObservers()
         NotificationCenter.default.removeObserver(self)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
@@ -41,8 +46,10 @@ final class AudioPlayerManager: NSObject, ObservableObject {
             return
         }
 
-        player?.stop()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
         player = nil
+        removePlaybackObservers()
         stopProgressUpdates()
         isPlaying = false
 
@@ -61,6 +68,11 @@ final class AudioPlayerManager: NSObject, ObservableObject {
                 play()
             }
         } catch {
+            player?.pause()
+            player?.replaceCurrentItem(with: nil)
+            player = nil
+            removePlaybackObservers()
+            logPlaybackPreparationFailure(for: currentTrack?.fileURL, error: error)
             playbackError = error.localizedDescription
         }
     }
@@ -99,15 +111,22 @@ final class AudioPlayerManager: NSObject, ObservableObject {
                 try preparePlayerForCurrentTrack()
             }
 
-            guard player?.play() == true else {
+            guard let player else {
                 playbackError = "Nao foi possivel iniciar a reproducao."
                 return
             }
 
+            if player.currentItem?.status == .failed {
+                handlePlaybackFailure(player.currentItem?.error)
+                return
+            }
+
+            player.play()
             isPlaying = true
             startProgressUpdates()
             updateNowPlayingInfo()
         } catch {
+            logPlaybackPreparationFailure(for: currentTrack?.fileURL, error: error)
             playbackError = error.localizedDescription
         }
     }
@@ -125,8 +144,10 @@ final class AudioPlayerManager: NSObject, ObservableObject {
     }
 
     func stop() {
-        player?.stop()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
         player = nil
+        removePlaybackObservers()
         isPlaying = false
         currentTrack = nil
         currentIndex = nil
@@ -173,7 +194,7 @@ final class AudioPlayerManager: NSObject, ObservableObject {
 
     func seek(to time: TimeInterval) {
         let clampedTime = min(max(time, 0), max(duration, 0))
-        player?.currentTime = clampedTime
+        player?.seek(to: CMTime(seconds: clampedTime, preferredTimescale: 600))
         currentTime = clampedTime
         updateNowPlayingPlaybackState()
     }
@@ -193,13 +214,17 @@ final class AudioPlayerManager: NSObject, ObservableObject {
             return
         }
 
-        let audioPlayer = try AVAudioPlayer(contentsOf: currentTrack.fileURL)
-        audioPlayer.delegate = self
-        audioPlayer.volume = volume
-        audioPlayer.prepareToPlay()
+        let fileURL = currentTrack.fileURL
+        try validatePlayableLocalFile(at: fileURL)
 
-        player = audioPlayer
-        duration = audioPlayer.duration.isFinite ? audioPlayer.duration : currentTrack.duration
+        let playerItem = AVPlayerItem(url: fileURL)
+        let avPlayer = AVPlayer(playerItem: playerItem)
+        avPlayer.volume = volume
+        avPlayer.actionAtItemEnd = .pause
+
+        player = avPlayer
+        observePlaybackItem(playerItem)
+        duration = currentTrack.duration
     }
 
     private func startProgressUpdates() {
@@ -222,9 +247,146 @@ final class AudioPlayerManager: NSObject, ObservableObject {
             return
         }
 
-        currentTime = player.currentTime
-        duration = player.duration.isFinite ? player.duration : duration
+        let playerTime = player.currentTime().seconds
+        if playerTime.isFinite {
+            currentTime = playerTime
+        }
+
+        let itemDuration = player.currentItem?.duration.seconds
+        if let itemDuration, itemDuration.isFinite, itemDuration > 0 {
+            duration = itemDuration
+        }
+
         updateNowPlayingPlaybackState()
+    }
+
+    private func observePlaybackItem(_ item: AVPlayerItem) {
+        removePlaybackObservers()
+
+        playerItemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor [weak self] in
+                switch item.status {
+                case .readyToPlay:
+                    let itemDuration = item.duration.seconds
+                    if itemDuration.isFinite, itemDuration > 0 {
+                        self?.duration = itemDuration
+                    }
+                    self?.updateNowPlayingInfo()
+                case .failed:
+                    self?.handlePlaybackFailure(item.error)
+                case .unknown:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        }
+
+        playbackEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handlePlaybackDidFinish()
+            }
+        }
+
+        playbackFailureObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] notification in
+            let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            Task { @MainActor [weak self] in
+                self?.handlePlaybackFailure(error)
+            }
+        }
+    }
+
+    private func removePlaybackObservers() {
+        playerItemStatusObservation?.invalidate()
+        playerItemStatusObservation = nil
+
+        if let playbackEndObserver {
+            NotificationCenter.default.removeObserver(playbackEndObserver)
+            self.playbackEndObserver = nil
+        }
+
+        if let playbackFailureObserver {
+            NotificationCenter.default.removeObserver(playbackFailureObserver)
+            self.playbackFailureObserver = nil
+        }
+    }
+
+    private func handlePlaybackDidFinish() {
+        if let currentIndex, queue.indices.contains(currentIndex + 1) {
+            load(queue: queue, startIndex: currentIndex + 1, autoplay: true)
+        } else {
+            pause()
+            seek(to: 0)
+        }
+    }
+
+    private func handlePlaybackFailure(_ error: Error?) {
+        pause()
+
+        if let error {
+            let nsError = error as NSError
+            playbackError = PlaybackPreparationError.decoderRejectedFile(
+                currentTrack?.fileURL,
+                underlying: nsError
+            ).localizedDescription
+            print("[AudioPlayerManager] Playback failed: \(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)")
+        } else {
+            playbackError = PlaybackPreparationError.unknownDecoderFailure(currentTrack?.fileURL).localizedDescription
+            print("[AudioPlayerManager] Playback failed with unknown decoder error.")
+        }
+    }
+
+    private func logPlaybackPreparationFailure(for url: URL?, error: Error) {
+        let nsError = error as NSError
+        print(
+            """
+            [AudioPlayerManager] Playback preparation failed: \(url?.lastPathComponent ?? "unknown file")
+            [AudioPlayerManager] Error: \(error.localizedDescription)
+            [AudioPlayerManager] NSError domain=\(nsError.domain) code=\(nsError.code)
+            """
+        )
+    }
+
+    private func validatePlayableLocalFile(at url: URL) throws {
+        let fileManager = FileManager.default
+
+        guard fileManager.fileExists(atPath: url.path) else {
+            throw PlaybackPreparationError.fileMissing(url)
+        }
+
+        guard fileManager.isReadableFile(atPath: url.path) else {
+            throw PlaybackPreparationError.fileUnreadable(url)
+        }
+
+        do {
+            let attributes = try fileManager.attributesOfItem(atPath: url.path)
+            let fileSize = attributes[.size] as? NSNumber
+            guard (fileSize?.int64Value ?? 0) > 0 else {
+                throw PlaybackPreparationError.emptyFile(url)
+            }
+
+            let fileHandle = try FileHandle(forReadingFrom: url)
+            defer {
+                try? fileHandle.close()
+            }
+
+            let sample = try fileHandle.read(upToCount: 64)
+            guard sample?.isEmpty == false else {
+                throw PlaybackPreparationError.emptyFile(url)
+            }
+        } catch let error as PlaybackPreparationError {
+            throw error
+        } catch {
+            throw PlaybackPreparationError.readProbeFailed(url, underlying: error)
+        }
     }
 
     private func updateNowPlayingInfo() {
@@ -414,22 +576,31 @@ final class AudioPlayerManager: NSObject, ObservableObject {
     }
 }
 
-extension AudioPlayerManager: AVAudioPlayerDelegate {
-    nonisolated func audioPlayerDidFinishPlaying(
-        _ player: AVAudioPlayer,
-        successfully flag: Bool
-    ) {
-        Task { @MainActor [weak self] in
-            guard let self else {
-                return
-            }
+private enum PlaybackPreparationError: LocalizedError {
+    case fileMissing(URL)
+    case fileUnreadable(URL)
+    case emptyFile(URL)
+    case readProbeFailed(URL, underlying: Error)
+    case decoderRejectedFile(URL?, underlying: NSError)
+    case unknownDecoderFailure(URL?)
 
-            if flag, let currentIndex, queue.indices.contains(currentIndex + 1) {
-                load(queue: queue, startIndex: currentIndex + 1, autoplay: true)
-            } else {
-                pause()
-                seek(to: 0)
-            }
+    var errorDescription: String? {
+        switch self {
+        case .fileMissing(let url):
+            return "O arquivo \(url.lastPathComponent) nao foi encontrado no armazenamento local do app. Importe a musica novamente."
+        case .fileUnreadable(let url):
+            return "O arquivo \(url.lastPathComponent) existe, mas nao pode ser lido pelo app."
+        case .emptyFile(let url):
+            return "O arquivo \(url.lastPathComponent) esta vazio ou foi importado incompleto. Apague e importe novamente."
+        case .readProbeFailed(let url, let underlying):
+            let nsError = underlying as NSError
+            return "Falha ao validar \(url.lastPathComponent) antes da reproducao (domain: \(nsError.domain), code: \(nsError.code))."
+        case .decoderRejectedFile(let url, let underlying):
+            let fileName = url?.lastPathComponent ?? "este arquivo"
+            return "Nao foi possivel reproduzir \(fileName). O arquivo pode estar incompleto, corrompido ou em um formato MP3 invalido para o iOS (domain: \(underlying.domain), code: \(underlying.code))."
+        case .unknownDecoderFailure(let url):
+            let fileName = url?.lastPathComponent ?? "este arquivo"
+            return "Nao foi possivel reproduzir \(fileName). Apague e importe novamente a partir de um arquivo baixado localmente."
         }
     }
 }
