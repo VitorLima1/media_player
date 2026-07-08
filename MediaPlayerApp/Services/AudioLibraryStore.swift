@@ -1,4 +1,5 @@
 import AVFoundation
+import Dispatch
 import Foundation
 
 protocol AudioLibraryStoring: Sendable {
@@ -9,6 +10,8 @@ protocol AudioLibraryStoring: Sendable {
 
 struct AudioLibraryStore: AudioLibraryStoring {
     static let supportedFileExtensions: Set<String> = ["mp3", "wav", "flac", "m4a"]
+    private static let ubiquitousDownloadTimeoutNanoseconds: UInt64 = 8_000_000_000
+    private static let ubiquitousDownloadPollIntervalNanoseconds: UInt64 = 500_000_000
 
     static var libraryDirectory: URL {
         FileManager.default
@@ -51,13 +54,29 @@ struct AudioLibraryStore: AudioLibraryStoring {
         var importedTracks: [AudioTrack] = []
 
         for url in urls {
-            try await withSecurityScopedAccess(to: url) {
-                let candidates = try audioFiles(in: url)
-                for sourceURL in candidates {
-                    let track = try await importFile(from: sourceURL)
-                    tracks.append(track)
-                    importedTracks.append(track)
+            do {
+                try await withSecurityScopedAccess(to: url) {
+                    try await prepareExternalItemForImport(at: url)
+
+                    let candidates = try audioFiles(in: url)
+                    guard !candidates.isEmpty else {
+                        throw AudioLibraryImportError.noSupportedAudioFiles(url)
+                    }
+
+                    for sourceURL in candidates {
+                        do {
+                            let track = try await importFile(from: sourceURL)
+                            tracks.append(track)
+                            importedTracks.append(track)
+                        } catch {
+                            logImportFailure(for: sourceURL, error: error)
+                            throw error
+                        }
+                    }
                 }
+            } catch {
+                logImportFailure(for: url, error: error)
+                throw error
             }
         }
 
@@ -84,10 +103,16 @@ struct AudioLibraryStore: AudioLibraryStoring {
 
     private func importFile(from sourceURL: URL) async throws -> AudioTrack {
         try await withSecurityScopedAccess(to: sourceURL) {
+            try await prepareExternalItemForImport(at: sourceURL)
+
             let storedFileName = "\(UUID().uuidString).\(sourceURL.pathExtension.lowercased())"
             let destinationURL = Self.libraryDirectory.appendingPathComponent(storedFileName)
 
-            try coordinatedCopy(from: sourceURL, to: destinationURL)
+            do {
+                try coordinatedCopy(from: sourceURL, to: destinationURL)
+            } catch {
+                throw AudioLibraryImportError.copyFailed(sourceURL, underlying: error)
+            }
 
             return try await makeTrack(
                 forLocalFile: destinationURL,
@@ -162,6 +187,96 @@ struct AudioLibraryStore: AudioLibraryStoring {
         supportedFileExtensions.contains(url.pathExtension.lowercased())
     }
 
+    private func prepareExternalItemForImport(at url: URL) async throws {
+        let values = try readableResourceValues(for: url)
+
+        if values.isDirectory != true, values.isUbiquitousItem == true {
+            try await requestUbiquitousDownloadIfNeeded(for: url, values: values)
+        }
+
+        try validateLocallyReadableContent(at: url)
+    }
+
+    private func readableResourceValues(for url: URL) throws -> URLResourceValues {
+        do {
+            return try url.resourceValues(
+                forKeys: [
+                    .isDirectoryKey,
+                    .isRegularFileKey,
+                    .isUbiquitousItemKey,
+                    .ubiquitousItemDownloadingStatusKey,
+                    .fileSizeKey
+                ]
+            )
+        } catch {
+            throw AudioLibraryImportError.resourceValuesUnavailable(url, underlying: error)
+        }
+    }
+
+    private func requestUbiquitousDownloadIfNeeded(
+        for url: URL,
+        values: URLResourceValues
+    ) async throws {
+        let status = values.ubiquitousItemDownloadingStatus
+        guard status != .current, status != .downloaded else {
+            return
+        }
+
+        do {
+            try fileManager.startDownloadingUbiquitousItem(at: url)
+            print("[AudioLibraryStore] iCloud download requested for \(url.lastPathComponent).")
+        } catch {
+            throw AudioLibraryImportError.iCloudDownloadFailed(url, underlying: error)
+        }
+
+        let deadline = DispatchTime.now().uptimeNanoseconds + Self.ubiquitousDownloadTimeoutNanoseconds
+
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            try Task.checkCancellation()
+
+            let refreshedValues = try readableResourceValues(for: url)
+            let refreshedStatus = refreshedValues.ubiquitousItemDownloadingStatus
+            if refreshedStatus == .current || refreshedStatus == .downloaded {
+                return
+            }
+
+            try await Task.sleep(nanoseconds: Self.ubiquitousDownloadPollIntervalNanoseconds)
+        }
+
+        throw AudioLibraryImportError.iCloudItemNotAvailable(url, status: status)
+    }
+
+    private func validateLocallyReadableContent(at url: URL) throws {
+        let values = try readableResourceValues(for: url)
+        if values.isDirectory == true {
+            return
+        }
+
+        guard fileManager.fileExists(atPath: url.path) else {
+            throw AudioLibraryImportError.localFileUnavailable(url)
+        }
+
+        guard fileManager.isReadableFile(atPath: url.path) else {
+            throw AudioLibraryImportError.localFileUnreadable(url)
+        }
+
+        do {
+            let fileHandle = try FileHandle(forReadingFrom: url)
+            defer {
+                try? fileHandle.close()
+            }
+
+            let sample = try fileHandle.read(upToCount: 1)
+            guard sample?.isEmpty == false else {
+                throw AudioLibraryImportError.emptyFile(url)
+            }
+        } catch let error as AudioLibraryImportError {
+            throw error
+        } catch {
+            throw AudioLibraryImportError.readProbeFailed(url, underlying: error)
+        }
+    }
+
     private func withSecurityScopedAccess<T>(
         to url: URL,
         operation: () async throws -> T
@@ -174,6 +289,17 @@ struct AudioLibraryStore: AudioLibraryStoring {
         }
 
         return try await operation()
+    }
+
+    private func logImportFailure(for url: URL, error: Error) {
+        let nsError = error as NSError
+        print(
+            """
+            [AudioLibraryStore] Import rejected: \(url.lastPathComponent)
+            [AudioLibraryStore] Error: \(error.localizedDescription)
+            [AudioLibraryStore] NSError domain=\(nsError.domain) code=\(nsError.code)
+            """
+        )
     }
 
     private func coordinatedCopy(from sourceURL: URL, to destinationURL: URL) throws {
@@ -236,5 +362,41 @@ struct AudioLibraryStore: AudioLibraryStoring {
 
         let data = try encoder.encode(tracks)
         try data.write(to: indexURL, options: [.atomic])
+    }
+}
+
+private enum AudioLibraryImportError: LocalizedError {
+    case resourceValuesUnavailable(URL, underlying: Error)
+    case iCloudDownloadFailed(URL, underlying: Error)
+    case iCloudItemNotAvailable(URL, status: URLUbiquitousItemDownloadingStatus?)
+    case localFileUnavailable(URL)
+    case localFileUnreadable(URL)
+    case emptyFile(URL)
+    case readProbeFailed(URL, underlying: Error)
+    case copyFailed(URL, underlying: Error)
+    case noSupportedAudioFiles(URL)
+
+    var errorDescription: String? {
+        switch self {
+        case .resourceValuesUnavailable(let url, let underlying):
+            return "Nao foi possivel ler os metadados de \(url.lastPathComponent): \(underlying.localizedDescription)"
+        case .iCloudDownloadFailed(let url, let underlying):
+            return "O iOS nao conseguiu baixar \(url.lastPathComponent) do iCloud: \(underlying.localizedDescription)"
+        case .iCloudItemNotAvailable(let url, let status):
+            return "O arquivo \(url.lastPathComponent) ainda nao esta disponivel localmente no iCloud. Status: \(status?.rawValue ?? "desconhecido")."
+        case .localFileUnavailable(let url):
+            return "O arquivo \(url.lastPathComponent) nao existe localmente ou esta apenas como placeholder."
+        case .localFileUnreadable(let url):
+            return "O arquivo \(url.lastPathComponent) nao pode ser lido pelo app."
+        case .emptyFile(let url):
+            return "O arquivo \(url.lastPathComponent) esta vazio ou indisponivel localmente."
+        case .readProbeFailed(let url, let underlying):
+            let nsError = underlying as NSError
+            return "Falha de leitura em \(url.lastPathComponent) (domain: \(nsError.domain), code: \(nsError.code)): \(underlying.localizedDescription)"
+        case .copyFailed(let url, let underlying):
+            return "Falha ao copiar \(url.lastPathComponent) para o sandbox: \(underlying.localizedDescription)"
+        case .noSupportedAudioFiles(let url):
+            return "Nenhum arquivo de audio suportado foi encontrado em \(url.lastPathComponent)."
+        }
     }
 }
