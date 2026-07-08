@@ -1,17 +1,65 @@
 workflows:
   ios-native-workflow:
-    name: iOS Native Build
+    name: iOS Native Build via XcodeGen
     max_build_duration: 30
-    instance_type: mac_mini_m1
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+      vars:
+        PROJECT_NAME: MediaPlayerApp
+        XCODEGEN_SPEC: project.yml
+        XCODE_PROJECT: MediaPlayerApp.xcodeproj
+        XCODE_SCHEME: MediaPlayerApp
+        DERIVED_DATA_PATH: build/DerivedData
+        UNSIGNED_IPA_PATH: build/MediaPlayerApp-unsigned.ipa
     scripts:
-      - name: Build iOS App (.app)
+      - name: Install XcodeGen
         script: |
+          set -e
+          # Codemagic checks out the GitHub repo on macOS. The repo does not
+          # need to contain an .xcodeproj; XcodeGen will create it here.
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        script: |
+          set -e
+          # project.yml lives at the repository root and maps the Swift files
+          # under MediaPlayerApp/App, Models, Services, ViewModels, Views and
+          # Utilities. The generated project appears as MediaPlayerApp.xcodeproj.
+          xcodegen generate --spec "$XCODEGEN_SPEC"
+          test -d "$XCODE_PROJECT"
+
+      - name: Build unsigned iOS app
+        script: |
+          set -e
           xcodebuild build \
-            -project "MediaPlayerApp/MediaPlayerApp.xcodeproj" \
-            -scheme "MediaPlayerApp" \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
             -sdk iphoneos \
             -configuration Release \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+
+      - name: Package unsigned ipa for Sideloadly
+        script: |
+          set -e
+          # xcodebuild outputs the unsigned .app inside DerivedData. Sideloadly
+          # can receive the .ipa and perform signing/install later on Windows.
+          APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release-iphoneos/$PROJECT_NAME.app"
+          test -d "$APP_PATH"
+
+          rm -rf build/unsigned
+          mkdir -p build/unsigned/Payload
+          cp -R "$APP_PATH" build/unsigned/Payload/
+
+          cd build/unsigned
+          zip -qry "../$(basename "$UNSIGNED_IPA_PATH")" Payload
     artifacts:
-      - build/Build/Products/Release-iphoneos/*.app
+      - build/MediaPlayerApp-unsigned.ipa
+      - build/DerivedData/Build/Products/Release-iphoneos/*.app
+      - build/DerivedData/Build/Products/Release-iphoneos/*.dSYM
+      - /tmp/xcodebuild_logs/*.log
