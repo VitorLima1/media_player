@@ -209,22 +209,19 @@ final class AudioPlayerManager: NSObject, ObservableObject {
         }
 
         let fileURL = currentTrack.fileURL
-        try validatePlayableSandboxFile(at: fileURL)
+        try playTrack(url: fileURL)
+        duration = currentTrack.duration
+    }
 
-        let asset = AVURLAsset(
-            url: fileURL,
-            options: [AVURLAssetPreferPreciseDurationAndTimingKey: false]
-        )
-        let item = AVPlayerItem(
-            asset: asset,
-            automaticallyLoadedAssetKeys: ["duration", "playable"]
-        )
+    private func playTrack(url: URL) throws {
+        try validatePlayableSandboxFile(at: url)
+
+        let item = AVPlayerItem(url: url)
         let avPlayer = AVPlayer(playerItem: item)
         avPlayer.volume = volume
         avPlayer.actionAtItemEnd = .pause
 
         player = avPlayer
-        duration = currentTrack.duration
 
         observePlayerItem(item)
         addPeriodicTimeObserver(to: avPlayer)
