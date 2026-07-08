@@ -1,0 +1,19 @@
+workflows:
+  ios-native-workflow:
+    name: iOS Native Build
+    max_build_duration: 30
+    instance_type: mac_mini_m1
+    environment:
+      ios_signing:
+        distribution_type: ad_hoc
+    scripts:
+      - name: Build iOS App (.app / .ipa)
+        script: |
+          xcodebuild build \
+            -project "MediaPlayerApp/MediaPlayerApp.xcodeproj" \
+            -scheme "MediaPlayerApp" \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO
+    artifacts:
+      - build/Build/Products/Release-iphoneos/*.app
