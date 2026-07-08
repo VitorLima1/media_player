@@ -36,7 +36,13 @@ final class AudioPlayerManager: NSObject, ObservableObject {
 
     deinit {
         progressTask?.cancel()
-        removePlaybackObservers()
+        playerItemStatusObservation?.invalidate()
+        if let playbackEndObserver {
+            NotificationCenter.default.removeObserver(playbackEndObserver)
+        }
+        if let playbackFailureObserver {
+            NotificationCenter.default.removeObserver(playbackFailureObserver)
+        }
         NotificationCenter.default.removeObserver(self)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
@@ -231,7 +237,7 @@ final class AudioPlayerManager: NSObject, ObservableObject {
         progressTask?.cancel()
         progressTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refreshProgress()
+                self?.refreshProgress()
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }

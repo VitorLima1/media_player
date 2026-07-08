@@ -14,13 +14,13 @@ final class PlayerViewModel: ObservableObject {
     private var hasLoadedLibrary = false
 
     init(
-        player: AudioPlayerManager = .shared,
+        player: AudioPlayerManager? = nil,
         library: any AudioLibraryStoring = AudioLibraryStore()
     ) {
-        self.player = player
+        self.player = player ?? AudioPlayerManager.shared
         self.library = library
 
-        player.objectWillChange
+        self.player.objectWillChange
             .sink { [weak self] _ in
                 Task { @MainActor [weak self] in
                     self?.objectWillChange.send()
@@ -28,7 +28,7 @@ final class PlayerViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        player.$playbackError
+        self.player.$playbackError
             .compactMap { $0 }
             .sink { [weak self] message in
                 Task { @MainActor [weak self] in
