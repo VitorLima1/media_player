@@ -9,7 +9,9 @@ protocol AudioLibraryStoring: Sendable {
 }
 
 struct AudioLibraryStore: AudioLibraryStoring {
-    static let supportedFileExtensions: Set<String> = ["mp3", "wav", "flac", "m4a"]
+    static let supportedFileExtensions: Set<String> = [
+        "mp3", "wav", "flac", "m4a", "caf", "ogg", "oga", "opus", "audio"
+    ]
     private static let ubiquitousDownloadTimeoutNanoseconds: UInt64 = 8_000_000_000
     private static let ubiquitousDownloadPollIntervalNanoseconds: UInt64 = 500_000_000
 
@@ -105,14 +107,18 @@ struct AudioLibraryStore: AudioLibraryStoring {
         try await withSecurityScopedAccess(to: sourceURL) {
             try await prepareExternalItemForImport(at: sourceURL)
 
-            let storedFileName = "\(UUID().uuidString).\(sourceURL.pathExtension.lowercased())"
+            let storedExtension = try preferredSandboxExtension(for: sourceURL)
+            let sanitizedName = sanitizedFileStem(from: sourceURL)
+            let storedFileName = "\(UUID().uuidString)-\(sanitizedName).\(storedExtension)"
             let destinationURL = Self.libraryDirectory.appendingPathComponent(storedFileName)
 
             do {
-                try coordinatedCopy(from: sourceURL, to: destinationURL)
+                try copyIntoSandbox(from: sourceURL, to: destinationURL)
             } catch {
                 throw AudioLibraryImportError.copyFailed(sourceURL, underlying: error)
             }
+
+            try validateSandboxCopy(at: destinationURL)
 
             return try await makeTrack(
                 forLocalFile: destinationURL,
@@ -176,15 +182,105 @@ struct AudioLibraryStore: AudioLibraryStoring {
                     return nil
                 }
 
-                return Self.isSupportedAudioFile(fileURL) ? fileURL : nil
+                return isSupportedAudioFile(fileURL) ? fileURL : nil
             } ?? [])
         }
 
-        return Self.isSupportedAudioFile(url) ? [url] : []
+        return isSupportedAudioFile(url) ? [url] : []
     }
 
-    private static func isSupportedAudioFile(_ url: URL) -> Bool {
-        supportedFileExtensions.contains(url.pathExtension.lowercased())
+    private func isSupportedAudioFile(_ url: URL) -> Bool {
+        if Self.supportedFileExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+
+        return (try? detectedContainerExtension(for: url)) != nil
+    }
+
+    private func preferredSandboxExtension(for sourceURL: URL) throws -> String {
+        let detectedExtension = try detectedContainerExtension(for: sourceURL)
+        if let detectedExtension {
+            return detectedExtension
+        }
+
+        let sourceExtension = sourceURL.pathExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if Self.supportedFileExtensions.contains(sourceExtension) {
+            return sourceExtension
+        }
+
+        return "audio"
+    }
+
+    private func detectedContainerExtension(for sourceURL: URL) throws -> String? {
+        let fileHandle = try FileHandle(forReadingFrom: sourceURL)
+        defer {
+            try? fileHandle.close()
+        }
+
+        guard let data = try fileHandle.read(upToCount: 64), !data.isEmpty else {
+            return nil
+        }
+
+        let bytes = Array(data)
+
+        if data.starts(with: Data("OggS".utf8)) {
+            return "ogg"
+        }
+
+        if data.starts(with: Data("caff".utf8)) {
+            return "caf"
+        }
+
+        if data.starts(with: Data("fLaC".utf8)) {
+            return "flac"
+        }
+
+        if data.starts(with: Data("ID3".utf8)) || looksLikeMPEGAudioFrame(bytes) {
+            return "mp3"
+        }
+
+        if data.starts(with: Data("RIFF".utf8)), bytes.count >= 12 {
+            let waveMarker = Data(bytes[8..<12])
+            if waveMarker == Data("WAVE".utf8) {
+                return "wav"
+            }
+        }
+
+        if bytes.count >= 8 {
+            let ftypMarker = Data(bytes[4..<8])
+            if ftypMarker == Data("ftyp".utf8) {
+                return "m4a"
+            }
+        }
+
+        return nil
+    }
+
+    private func looksLikeMPEGAudioFrame(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 2 else {
+            return false
+        }
+
+        return bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0
+    }
+
+    private func sanitizedFileStem(from sourceURL: URL) -> String {
+        let rawName = sourceURL
+            .deletingPathExtension()
+            .lastPathComponent
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+
+        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let pieces = rawName
+            .components(separatedBy: allowedCharacters.inverted)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let sanitized = pieces.joined(separator: "-")
+        return String((sanitized.isEmpty ? "audio" : sanitized).prefix(48))
     }
 
     private func prepareExternalItemForImport(at url: URL) async throws {
@@ -302,30 +398,20 @@ struct AudioLibraryStore: AudioLibraryStoring {
         )
     }
 
-    private func coordinatedCopy(from sourceURL: URL, to destinationURL: URL) throws {
-        let coordinator = NSFileCoordinator(filePresenter: nil)
-        var coordinationError: NSError?
-        var copyError: Error?
-
-        coordinator.coordinate(
-            readingItemAt: sourceURL,
-            options: [],
-            error: &coordinationError
-        ) { readableURL in
-            do {
-                try fileManager.copyItem(at: readableURL, to: destinationURL)
-            } catch {
-                copyError = error
-            }
+    private func copyIntoSandbox(from sourceURL: URL, to destinationURL: URL) throws {
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
         }
 
-        if let copyError {
-            throw copyError
+        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+    }
+
+    private func validateSandboxCopy(at url: URL) throws {
+        guard url.path.hasPrefix(Self.libraryDirectory.path) else {
+            throw AudioLibraryImportError.sandboxCopyInvalid(url)
         }
 
-        if let coordinationError {
-            throw coordinationError
-        }
+        try validateLocallyReadableContent(at: url)
     }
 
     private func ensureDirectoriesExist() throws {
@@ -374,6 +460,7 @@ private enum AudioLibraryImportError: LocalizedError {
     case emptyFile(URL)
     case readProbeFailed(URL, underlying: Error)
     case copyFailed(URL, underlying: Error)
+    case sandboxCopyInvalid(URL)
     case noSupportedAudioFiles(URL)
 
     var errorDescription: String? {
@@ -395,6 +482,8 @@ private enum AudioLibraryImportError: LocalizedError {
             return "Falha de leitura em \(url.lastPathComponent) (domain: \(nsError.domain), code: \(nsError.code)): \(underlying.localizedDescription)"
         case .copyFailed(let url, let underlying):
             return "Falha ao copiar \(url.lastPathComponent) para o sandbox: \(underlying.localizedDescription)"
+        case .sandboxCopyInvalid(let url):
+            return "A copia local de \(url.lastPathComponent) nao ficou dentro do sandbox do app."
         case .noSupportedAudioFiles(let url):
             return "Nenhum arquivo de audio suportado foi encontrado em \(url.lastPathComponent)."
         }
