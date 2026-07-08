@@ -118,12 +118,6 @@ struct ContentView: View {
 
 private extension UTType {
     static var supportedAudioImportTypes: [UTType] {
-        [
-            .audio,
-            UTType(filenameExtension: "mp3"),
-            UTType(filenameExtension: "wav"),
-            UTType(filenameExtension: "flac"),
-            UTType(filenameExtension: "m4a")
-        ].compactMap { $0 }
+        [.mp3, .mpeg4Audio, .wav, .audio, .data]
     }
 }

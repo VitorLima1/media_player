@@ -51,18 +51,13 @@ struct AudioLibraryStore: AudioLibraryStoring {
         var importedTracks: [AudioTrack] = []
 
         for url in urls {
-            let didStartAccessing = url.startAccessingSecurityScopedResource()
-            defer {
-                if didStartAccessing {
-                    url.stopAccessingSecurityScopedResource()
+            try await withSecurityScopedAccess(to: url) {
+                let candidates = try audioFiles(in: url)
+                for sourceURL in candidates {
+                    let track = try await importFile(from: sourceURL)
+                    tracks.append(track)
+                    importedTracks.append(track)
                 }
-            }
-
-            let candidates = try audioFiles(in: url)
-            for sourceURL in candidates {
-                let track = try await importFile(from: sourceURL)
-                tracks.append(track)
-                importedTracks.append(track)
             }
         }
 
@@ -88,16 +83,18 @@ struct AudioLibraryStore: AudioLibraryStoring {
     }
 
     private func importFile(from sourceURL: URL) async throws -> AudioTrack {
-        let storedFileName = "\(UUID().uuidString).\(sourceURL.pathExtension.lowercased())"
-        let destinationURL = Self.libraryDirectory.appendingPathComponent(storedFileName)
+        try await withSecurityScopedAccess(to: sourceURL) {
+            let storedFileName = "\(UUID().uuidString).\(sourceURL.pathExtension.lowercased())"
+            let destinationURL = Self.libraryDirectory.appendingPathComponent(storedFileName)
 
-        try coordinatedCopy(from: sourceURL, to: destinationURL)
+            try coordinatedCopy(from: sourceURL, to: destinationURL)
 
-        return try await makeTrack(
-            forLocalFile: destinationURL,
-            sourceFileName: sourceURL.lastPathComponent,
-            storedFileName: storedFileName
-        )
+            return try await makeTrack(
+                forLocalFile: destinationURL,
+                sourceFileName: sourceURL.lastPathComponent,
+                storedFileName: storedFileName
+            )
+        }
     }
 
     private func makeTrack(
@@ -163,6 +160,20 @@ struct AudioLibraryStore: AudioLibraryStoring {
 
     private static func isSupportedAudioFile(_ url: URL) -> Bool {
         supportedFileExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    private func withSecurityScopedAccess<T>(
+        to url: URL,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let didStartAccessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        return try await operation()
     }
 
     private func coordinatedCopy(from sourceURL: URL, to destinationURL: URL) throws {
